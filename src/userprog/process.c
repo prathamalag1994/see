@@ -5,9 +5,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "userprog/syscall.h"
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
 #include "userprog/tss.h"
+#include "userprog/syscall.h"
 #include "filesys/directory.h"
 #include "filesys/file.h"
 #include "filesys/filesys.h"
@@ -15,13 +17,22 @@
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/palloc.h"
-#include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "devices/timer.h"
+#include "threads/malloc.h"
 
-static struct semaphore temporary;
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+
+
+struct token_list_elem {
+  char arg[128];
+  int addr;
+
+  struct list_elem elem;
+};
+
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -33,7 +44,6 @@ process_execute (const char *file_name)
   char *fn_copy;
   tid_t tid;
 
-  sema_init (&temporary, 0);
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page (0);
@@ -45,6 +55,15 @@ process_execute (const char *file_name)
   tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
   if (tid == TID_ERROR)
     palloc_free_page (fn_copy); 
+  else {
+    char* save_ptr;
+    char* filename_copy = palloc_get_page(0);
+    strlcpy (filename_copy, file_name, PGSIZE);
+    char *token = strtok_r (filename_copy, " ", &save_ptr);
+    add_process_to_list(token, tid);
+    palloc_free_page(filename_copy);
+
+  } 
   return tid;
 }
 
@@ -90,9 +109,20 @@ start_process (void *file_name_)
    does nothing. */
 int
 process_wait (tid_t child_tid UNUSED) 
-{
-  sema_down (&temporary);
-  return 0;
+{  
+  int exit_code = -1;
+
+  struct process_info* pi = get_process_info(child_tid);
+  if (pi == NULL) return -1;
+
+  while (pi->exit_code == -1000) {
+    timer_sleep(50);
+    pi = get_process_info(child_tid);
+  }
+
+  exit_code = pi->exit_code;			//--------------------------------------------added these lines to pass wait_twice test
+  list_remove(&pi->elem);			//--------------------------------------------removes the proceses from the list
+  return exit_code;
 }
 
 /* Free the current process's resources. */
@@ -118,7 +148,6 @@ process_exit (void)
       pagedir_activate (NULL);
       pagedir_destroy (pd);
     }
-  sema_up (&temporary);
 }
 
 /* Sets up the CPU for running user code in the current
@@ -213,6 +242,7 @@ static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
 bool
 load (const char *file_name, void (**eip) (void), void **esp) 
 {
+
   struct thread *t = thread_current ();
   struct Elf32_Ehdr ehdr;
   struct file *file = NULL;
@@ -226,8 +256,15 @@ load (const char *file_name, void (**eip) (void), void **esp)
     goto done;
   process_activate ();
 
+  char *save_ptr1;
+  char* filename_copy = palloc_get_page(0);
+  strlcpy (filename_copy, file_name, PGSIZE);
+  char *exename = strtok_r (filename_copy, " ", &save_ptr1);
+
   /* Open executable file. */
-  file = filesys_open (file_name);
+  file = filesys_open (exename);
+
+  palloc_free_page(filename_copy);
   if (file == NULL) 
     {
       printf ("load: %s: open failed\n", file_name);
@@ -310,6 +347,56 @@ load (const char *file_name, void (**eip) (void), void **esp)
   if (!setup_stack (esp))
     goto done;
 
+  /* Tahir: parse args and put them on the stack */
+
+  struct list token_list;
+  list_init(&token_list);
+
+  char *save_ptr;
+  char *token = strtok_r ((char *)file_name, " ", &save_ptr);			//const * typecasting 
+  int argc = 0;
+  while (token != NULL) {
+    *esp = *esp - (strlen(token) + 1);
+    memcpy( (void*) (*esp), token,
+            strlen(token) + 1 );
+
+    struct token_list_elem* tle = (struct token_list_elem*) malloc(sizeof(struct token_list_elem));
+    memcpy(tle->arg, token, strlen(token));
+    tle->addr = (int)*esp;
+
+    list_push_front(&token_list, &tle->elem);
+
+    token = strtok_r (NULL, " ", &save_ptr);
+    argc++;
+  }
+  *esp = *esp - 4;
+  *((int*)(*esp)) = 0;
+
+  //argv[i]'s
+  while ( !list_empty(&token_list) ) {
+    struct token_list_elem* tle = list_entry(list_pop_front(&token_list), struct token_list_elem, elem);
+
+    *esp = *esp - 4;
+    int* stack_ptr = *esp;
+    *stack_ptr = (tle->addr);
+
+    free(tle);
+  }
+
+  //argv
+  int* stack_ptr = (*esp - 4);
+  *stack_ptr = (int)(*esp);
+  *esp = *esp - 4;
+
+  //argc
+  *esp = *esp - 4;
+  *((int*)(*esp)) = argc;
+
+  //ret value
+  *esp = *esp - 4;
+  *((int*)(*esp)) = 0;
+
+
   /* Start address. */
   *eip = (void (*) (void)) ehdr.e_entry;
 
@@ -320,7 +407,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
   file_close (file);
   return success;
 }
-
+
 /* load() helpers. */
 
 static bool install_page (void *upage, void *kpage, bool writable);
@@ -468,3 +555,4 @@ install_page (void *upage, void *kpage, bool writable)
   return (pagedir_get_page (t->pagedir, upage) == NULL
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
 }
+
